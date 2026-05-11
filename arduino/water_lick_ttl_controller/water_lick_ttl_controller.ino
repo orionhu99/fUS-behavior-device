@@ -59,9 +59,16 @@ void setup() {
   Serial.begin(115200);
   while (!Serial) {}
 
+  // 先试 0x5A（标准），失败则试 0x5B（国产模块常见地址）
   mpr121Ready = cap.begin(0x5A);
+  if (!mpr121Ready) {
+    mpr121Ready = cap.begin(0x5B);
+    if (mpr121Ready) {
+      Serial.println("MPR121 found at 0x5B (alt address)");
+    }
+  }
   if (mpr121Ready) {
-    cap.setThresholds(12, 6);
+    cap.setThresholds(16, 8);
   }
 
   logEvent("READY", mpr121Ready ? "MPR121_OK" : "MPR121_MISSING");
@@ -142,6 +149,15 @@ void handleCommand(String cmd) {
   } else if (cmd.startsWith("SYNCMS ")) {
     syncIntervalMs = parseNumberAfterSpace(cmd, syncIntervalMs);
     logEvent("SYNC_MS", String(syncIntervalMs));
+  } else if (cmd == "MDEBUG") {
+    // 打印 MPR121 原始寄存器用于诊断
+    uint16_t touched = cap.touched();
+    int filtered0 = cap.filteredData(lickElectrode);
+    int baseline0 = cap.baselineData(lickElectrode);
+    Serial.print(millis()); Serial.print(",DEBUG,");
+    Serial.print("touched=0x"); Serial.print(touched, HEX);
+    Serial.print(",filtered="); Serial.print(filtered0);
+    Serial.print(",baseline="); Serial.println(baseline0);
   } else {
     logEvent("ERR", "UNKNOWN_COMMAND");
   }
@@ -159,8 +175,19 @@ void readButton() {
 void readLick(unsigned long now) {
   if (!mpr121Ready) return;
 
-  uint16_t touched = cap.touched();
-  bool isTouched = touched & (1 << lickElectrode);
+  // 软件舔水检测：用 filtered 变化代替硬件 touched 位
+  int filtered = cap.filteredData(lickElectrode);
+  if (filtered < 0) filtered = 0;
+
+  // 指数移动平均基线
+  static float swBaseline = -1;
+  if (swBaseline < 0) swBaseline = (float)filtered;
+  swBaseline = swBaseline * 0.995 + filtered * 0.005;
+
+  // 触碰使 filtered 下降（电容被人体泄放）
+  int delta = (int)(swBaseline - filtered);
+  bool isTouched = (delta >= 6);   // 变化 ≥4 视为舔水
+
   if (isTouched && !lastTouched && now - lastLickAt >= lickRefractoryMs) {
     lastLickAt = now;
     pulseLickTtl(now);
