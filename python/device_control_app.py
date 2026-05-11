@@ -31,6 +31,44 @@ try:
 except ImportError:
     winsound = None
 
+# PC 3.5mm 音频播放 8kHz 纯音（不依赖 Bpod/HiFi）
+def play_8khz_cue(duration_ms=80, volume=0.5):
+    """通过默认音频输出设备（3.5mm/音箱）播放 8kHz 正弦波。"""
+    import math
+    import os
+    import struct
+    import tempfile
+    import wave
+
+    sample_rate = 44100
+    n_samples = int(sample_rate * duration_ms / 1000)
+    buf = b""
+    for i in range(n_samples):
+        t = i / sample_rate
+        val = int(32767 * volume * math.sin(2 * math.pi * 8000 * t))
+        buf += struct.pack("<h", val)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    try:
+        with wave.open(tmp.name, "w") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(buf)
+        winsound.PlaySound(tmp.name, winsound.SND_FILENAME | winsound.SND_ASYNC)
+    finally:
+        # 播放是异步的，延迟后删除临时文件
+        import threading
+        def _cleanup():
+            import time as _time
+            _time.sleep(duration_ms / 1000 + 0.2)
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+        threading.Thread(target=_cleanup, daemon=True).start()
+
 from protocol_engine import ProtocolEngine
 from config_manager import ConfigManager
 from lick_plot import LickPlot
@@ -39,6 +77,7 @@ from gui_panels import (
     ManualControlPanel,
     MotorControlPanel,
     ProtocolPanel,
+    StatusPanel,
     EventLogPanel,
 )
 
@@ -213,7 +252,7 @@ class VideoRecorder:
         if self.cap:
             self.cap.release()
             self.cap = None
-        cv2.destroyWindow("摄像头预览")
+        cv2.destroyWindow("Camera Preview")
 
     def _capture_loop(self):
         frame_id = 0
@@ -225,7 +264,7 @@ class VideoRecorder:
                 continue
 
             # 预览窗口
-            cv2.imshow("摄像头预览", frame)
+            cv2.imshow("Camera Preview", frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 # 按 Q 关闭预览（不关录像）
@@ -246,7 +285,7 @@ class VideoRecorder:
         if self.cap:
             self.cap.release()
             self.cap = None
-        cv2.destroyWindow("摄像头预览")
+        cv2.destroyWindow("Camera Preview")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -257,7 +296,12 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("fUS behavior device control")
-        self.geometry("1000x750")
+        self.geometry("1040x720")
+        self.minsize(800, 500)
+
+        # 根窗口自适应
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
 
         # 共享队列
         self.events = queue.Queue()
@@ -271,12 +315,9 @@ class App(tk.Tk):
         self.protocol_engine = ProtocolEngine(self.water, self.events)
         self.config_mgr = ConfigManager()
 
-        # 日志文件
+        # 日志
         self.log_file = None
         self.log_writer = None
-
-        # PC beep 开关
-        self.pc_beep = tk.BooleanVar(value=False)
 
         # 输出目录
         self.output_dir = tk.StringVar(value=str(Path.cwd() / "recordings"))
@@ -284,10 +325,8 @@ class App(tk.Tk):
         # 构建 UI
         self._build_ui()
 
-        # 协议引擎试次完成回调 → 舔水图表
+        # 回调
         self.protocol_engine.on_trial_complete = self._lick_plot.add_trial
-
-        # 协议状态变化：保留面板回调 + 增加自动录像
         self._panel_state_cb = self.protocol_engine.on_state_changed
         self.protocol_engine.on_state_changed = self._combined_state_changed
 
@@ -298,44 +337,60 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
-        # 连接面板
+        # 根窗口自适应权重
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        # ── 垂直分隔：中部可伸缩区 + 底部日志 ──
+        vpane = ttk.PanedWindow(self, orient="vertical")
+        vpane.grid(row=0, column=0, sticky="nsew", padx=8, pady=4)
+
+        # 顶部：连接面板（固定）
         self.conn_panel = ConnectionPanel(
-            self, self.water, self.spout_motor, self.video, self.output_dir
+            vpane, self.water, self.spout_motor, self.video, self.output_dir
         )
         self.conn_panel._ensure_log = self._ensure_log
-        self.conn_panel.pack(fill="x", padx=10, pady=6)
 
-        # 中间：左右分栏
-        mid = ttk.Frame(self)
-        mid.pack(fill="both", expand=True, padx=10, pady=4)
+        # 状态面板
+        self.status_panel = StatusPanel(vpane)
 
-        left = ttk.Frame(mid)
-        left.pack(side="left", fill="both", expand=True)
+        # ── 中部：水平分隔 左侧(控制+图表) | 右侧(协议) ──
+        hpane = ttk.PanedWindow(vpane, orient="horizontal")
 
-        right = ttk.Frame(mid)
-        right.pack(side="right", fill="both", expand=True, padx=(8, 0))
+        # 左侧面板
+        left = ttk.Frame(hpane)
+        left.rowconfigure(2, weight=1)
+        left.columnconfigure(0, weight=1)
 
-        # 手动控制
-        self.manual_panel = ManualControlPanel(left, self.water, self.events, self.pc_beep)
-        self.manual_panel.pack(fill="x", pady=2)
+        self.manual_panel = ManualControlPanel(left, self.water, self.events, tk.BooleanVar(value=False))
+        self.manual_panel.grid(row=0, column=0, sticky="ew", pady=2)
 
-        # 电机控制
         self.motor_panel = MotorControlPanel(left, self.spout_motor)
-        self.motor_panel.pack(fill="x", pady=2)
-
-        # 协议控制（右侧）
-        self.protocol_panel = ProtocolPanel(right, self.protocol_engine, self.config_mgr)
-        self.protocol_panel.pack(fill="x", pady=2)
+        self.motor_panel.grid(row=1, column=0, sticky="ew", pady=2)
 
         # 舔水图表
         plot_frame = ttk.LabelFrame(left, text="舔水时间线")
-        plot_frame.pack(fill="both", expand=True, pady=2)
+        plot_frame.grid(row=2, column=0, sticky="nsew", pady=2)
+        plot_frame.rowconfigure(0, weight=1)
+        plot_frame.columnconfigure(0, weight=1)
         self._lick_plot = LickPlot(plot_frame)
-        self._lick_plot.widget.pack(fill="both", expand=True, padx=4, pady=4)
+        self._lick_plot.widget.pack(fill="both", expand=True, padx=2, pady=2)
 
-        # 事件日志
-        self.log_panel = EventLogPanel(self)
-        self.log_panel.pack(fill="both", expand=True, padx=10, pady=4)
+        # 右侧：协议面板
+        self.protocol_panel = ProtocolPanel(hpane, self.protocol_engine, self.config_mgr)
+
+        # 添加可拖动的面板
+        hpane.add(left, weight=3)
+        hpane.add(self.protocol_panel, weight=2)
+
+        # ── 底部：事件日志 ──
+        self.log_panel = EventLogPanel(vpane)
+
+        # 组装垂直分隔
+        vpane.add(self.conn_panel, weight=0)
+        vpane.add(self.status_panel, weight=0)
+        vpane.add(hpane, weight=1)
+        vpane.add(self.log_panel, weight=0)
 
     # ── 日志 ────────────────────────────────────────
 
@@ -366,9 +421,13 @@ class App(tk.Tk):
                 self.log_writer.writerow([f"{wall:.6f}", f"{mono:.6f}", source, device, event, value])
                 self.log_file.flush()
 
-            # GUI 日志面板
-            line = f"{wall:.3f} | {device} | {event} | {value}\n"
-            self.log_panel.append(line)
+            # GUI 日志面板（过滤高频 SYNC 事件）
+            if event != "SYNC":
+                line = f"{wall:.3f} | {device} | {event} | {value}\n"
+                self.log_panel.append(line)
+
+            # 更新状态面板
+            self._update_status(source, device, event, value)
 
             # 转发给协议引擎（仅 serial 源事件）
             if source == "serial" and device == "water":
@@ -383,19 +442,49 @@ class App(tk.Tk):
         self.protocol_engine.tick()
         self.after(20, self._tick_protocol)
 
+    def _update_status(self, source, device, event, value):
+        if device == "water" and event == "CONNECTED":
+            self.status_panel.set_water_connected()
+            if "MPR121_OK" in value:
+                self.status_panel.set_mpr121(True)
+        elif device == "water" and event == "RX":
+            parts = value.split(",")
+            if len(parts) >= 3:
+                evt = parts[1]
+                if evt == "LICK" or evt.startswith("WINDOW_LICK"):
+                    self.status_panel.set_lick(f"T+{time.perf_counter() - (self.protocol_engine._session_mono_start or 0):.1f}s")
+                elif evt == "WATER" or evt == "WINDOW_REWARD":
+                    self.status_panel.set_water_ev(f"T+{time.perf_counter() - (self.protocol_engine._session_mono_start or 0):.1f}s")
+                elif evt == "READY":
+                    self.status_panel.set_mpr121("MPR121_OK" in value)
+        elif device == "spout_motor" and event == "CONNECTED":
+            self.status_panel.set_motor_connected()
+        elif device == "camera" and event == "PREVIEW_START":
+            self.status_panel.set_camera("● 预览中")
+        elif device == "camera" and event == "RECORDING_START":
+            self.status_panel.set_camera("● 录像中")
+        elif device == "camera" and event in ("PREVIEW_STOP", "RECORDING_STOP", "VIDEO_STOP"):
+            self.status_panel.set_camera("○ 未启动")
+
     def _combined_state_changed(self, state, info):
         if self._panel_state_cb:
             self._panel_state_cb(state, info)
         self._on_protocol_state(state, info)
+        self.status_panel.set_state(info["state"])
+        self.status_panel.set_trial(str(info["trial_num"]))
+        # 泵状态
+        if info["state"] == "TRIAL":
+            self.status_panel.set_pump(True)
+        else:
+            self.status_panel.set_pump(False)
 
     def _on_protocol_state(self, state, info):
-        # 协议运行时自动录像，停止时自动停止
         from protocol_engine import State
         if state == State.IDLE:
             if self.video.recording:
                 self.video.stop_recording()
                 self.conn_panel._btn_record.config(text="录像")
-        else:
+        elif state != State.PAUSED:
             if not self.video.recording and self.water.port:
                 self._ensure_log()
                 try:
@@ -403,9 +492,9 @@ class App(tk.Tk):
                         self.conn_panel.camera_index.get(),
                         self.output_dir.get()
                     )
-                    self.conn_panel._btn_record.config(text="停止录像")
+                    self.conn_panel._btn_record.config(text="停止")
                 except Exception:
-                    pass  # 摄像头可能未连接
+                    pass
 
     # ── 关闭 ────────────────────────────────────────
 

@@ -1,46 +1,25 @@
-"""试次状态机：管理 cue-触发式给水协议。
+"""试次状态机。
 
-协议流程：
-IDLE → ITI → PRECUE → CUE → WINDOW → REWARD/POST_REWARD → ITI
-任意状态 → PAUSED（暂停）/ IDLE（停止）
-
-关键延迟路径（舔→给水）在 Water Nano 上自治执行，不经过 USB。
-Python 端只负责试次调度和日志记录。
+流程：IDLE → ITI → TRIAL(cue→舔水窗) → ITI → ...
+智能补水：上次 MISS 则跳过泵（水未消耗），上次 REWARDED 则补水
 """
 
 import enum
 import random
+import threading
 import time
 from collections import namedtuple
 
 TrialResult = namedtuple("TrialResult", [
     "trial_num", "outcome", "iti_s",
-    "cue_time", "lick_time", "reward_time",
+    "cue_time", "lick_times",       # 试次内舔水时刻
+    "iti_lick_times",               # ITI 期间的舔水时刻
 ])
-
-
-class State(enum.Enum):
-    IDLE = "IDLE"
-    ITI = "ITI"
-    PRECUE = "PRECUE"
-    CUE = "CUE"
-    WINDOW = "WINDOW"
-    POST_REWARD = "POST_REWARD"
-    PAUSED = "PAUSED"
-
-
-class Outcome(enum.Enum):
-    PENDING = "PENDING"
-    REWARDED = "REWARDED"
-    MISSED = "MISSED"
-
 
 DEFAULT_PARAMS = {
     "cue_duration_ms": 80,
-    "precue_ms": 200,
-    "window_duration_ms": 3000,
+    "window_duration_ms": 2000,
     "reward_dose_ms": 400,
-    "post_reward_ms": 500,
     "iti_min_s": 20.0,
     "iti_max_s": 60.0,
     "max_trials": 200,
@@ -48,66 +27,57 @@ DEFAULT_PARAMS = {
 }
 
 
+class State(enum.Enum):
+    IDLE = "IDLE"
+    ITI = "ITI"
+    TRIAL = "TRIAL"
+    PAUSED = "PAUSED"
+
+
 class ProtocolEngine:
-    """试次协议状态机。
-
-    通过持有的 SerialDevice（water Nano）发送命令，
-    通过回调将状态变化通知 GUI 面板。
-    """
-
     def __init__(self, serial_device, event_queue):
         self._dev = serial_device
         self._events = event_queue
 
-        # 参数
         self.params = dict(DEFAULT_PARAMS)
-
-        # 状态
         self.state = State.IDLE
-        self._state_before_pause: State | None = None
+        self._state_before_pause = None
+
         self._trial_num = 0
         self._total_licks = 0
         self._total_rewards = 0
         self._total_missed = 0
 
-        # 当前试次计时
-        self._state_start: float = 0.0
-        self._deadline: float = 0.0
-        self._iti_duration: float = 0.0
-        self._current_outcome = Outcome.PENDING
-        self._trial_lick_time: float | None = None
-        self._trial_reward_time: float | None = None
-        self._trial_cue_time: float | None = None
+        self._trial_start_mono = 0.0
+        self._deadline = 0.0
+        self._iti_duration = 0.0
+        self._trial_lick_times = []    # 本次 trial 所有舔水时刻
+        self._iti_lick_times = []      # 当前 ITI 期间的舔水时刻
+        self._prev_missed = False      # 上次 trial 是否 MISS
+        self._session_mono_start = 0.0
 
-        # 会话计时
-        self._session_start: float | None = None
+        self.on_state_changed = None
+        self.on_trial_complete = None
+        self.on_params_changed = None
 
-        # 协议引擎自己的事件日志（补充 serial 事件）
-        self._mono_start: float | None = None
-
-        # 回调
-        self.on_state_changed = None        # fn(state: State, info: dict)
-        self.on_trial_complete = None       # fn(result: TrialResult)
-        self.on_params_changed = None        # fn(params: dict)
-
-    # ── 公共方法 ────────────────────────────────────────
+    # ── 公共 ──────────────────────────────────────────
 
     def start(self):
         if self.state != State.IDLE:
             return
-        self._session_start = time.time()
-        self._mono_start = time.perf_counter()
+        self._session_mono_start = time.perf_counter()
         self._trial_num = 0
         self._total_licks = 0
         self._total_rewards = 0
         self._total_missed = 0
+        self._prev_missed = False
         self._transition(State.ITI)
 
     def stop(self):
         self._dev.write("STOP")
         self.state = State.IDLE
         self._state_before_pause = None
-        self._state_start = 0
+        self._deadline = 0.0
         self._notify_state()
 
     def pause(self):
@@ -127,156 +97,123 @@ class ProtocolEngine:
         if self.on_params_changed:
             self.on_params_changed(self.params)
 
-    # ── 由 GUI 定时驱动（~20ms 间隔）────────────────────
-
     def tick(self):
         if self.state in (State.IDLE, State.PAUSED):
             return
         self._check_session_timeout()
         self._check_deadline()
 
-    # ── 串口事件处理 ────────────────────────────────────
-
     def handle_serial_event(self, device: str, event: str, value: str):
-        """由 GUI 的 _drain_events 调用，处理来自 Nano 的事件。"""
         if device != "water":
             return
 
         if event == "LICK":
             self._total_licks += 1
-            if self.state == State.WINDOW:
-                self._trial_lick_time = time.perf_counter()
+            if self.state == State.TRIAL:
+                self._trial_lick_times.append(time.perf_counter())
+            elif self.state == State.ITI:
+                self._iti_lick_times.append(time.perf_counter())
 
-        elif event == "WINDOW_LICK":
-            # Nano 在窗口内检测到舔水（已在 Nano 端触发奖励）
-            pass
-
-        elif event == "WINDOW_REWARD":
-            self._current_outcome = Outcome.REWARDED
-            self._total_rewards += 1
-            self._trial_reward_time = time.perf_counter()
-
-        elif event == "WINDOW_END":
-            if value == "MISSED":
-                self._current_outcome = Outcome.MISSED
-                self._total_missed += 1
-            # 无论 REWARDED 还是 MISSED，窗口结束 → 进入后奖励期或 ITI
-            if self.state == State.WINDOW:
-                if self._current_outcome == Outcome.REWARDED:
-                    self._transition(State.POST_REWARD)
-                else:
-                    self._complete_trial()
-
-    # ── 内部状态转换 ────────────────────────────────────
+    # ── 状态转换 ──────────────────────────────────────
 
     def _transition(self, new_state: State):
-        old = self.state
         self.state = new_state
-        self._state_start = time.perf_counter()
         self._deadline = 0.0
-
         if new_state == State.ITI:
             self._start_iti()
-        elif new_state == State.PRECUE:
-            self._start_precue()
-        elif new_state == State.CUE:
-            self._start_cue()
-        elif new_state == State.WINDOW:
-            self._start_window()
-        elif new_state == State.POST_REWARD:
-            self._start_post_reward()
-
+        elif new_state == State.TRIAL:
+            self._start_trial()
         self._notify_state()
 
     def _start_iti(self):
-        if self._trial_num > 0 and self._current_outcome != Outcome.PENDING:
-            self._finish_trial()
+        if self._trial_num > 0:
+            licked = len(self._trial_lick_times) > 0
+            outcome = "REWARDED" if licked else "MISSED"
+            if outcome == "REWARDED":
+                self._total_rewards += 1
+                self._prev_missed = False
+            else:
+                self._total_missed += 1
+                self._prev_missed = True
+
+            result = TrialResult(
+                trial_num=self._trial_num,
+                outcome=outcome,
+                iti_s=round(self._iti_duration, 2),
+                cue_time=self._trial_start_mono,
+                lick_times=list(self._trial_lick_times),
+                iti_lick_times=list(self._iti_lick_times),
+            )
+            self._log("TRIAL_END", outcome)
+            if self.on_trial_complete:
+                self.on_trial_complete(result)
 
         self._trial_num += 1
-        if self.params["max_trials"] > 0 and self._trial_num > self.params["max_trials"]:
+        if 0 < self.params["max_trials"] < self._trial_num:
             self._log("SESSION_END", "MAX_TRIALS")
-            self._transition(State.IDLE)
+            self.stop()
             return
 
-        self._current_outcome = Outcome.PENDING
-        self._trial_lick_time = None
-        self._trial_reward_time = None
-        self._trial_cue_time = None
-
+        self._trial_lick_times = []
+        self._iti_lick_times = []
         iti_s = random.uniform(self.params["iti_min_s"], self.params["iti_max_s"])
         self._iti_duration = iti_s
-        self._deadline = self._state_start + iti_s
-        self._log("ITI_START", f"{iti_s:.1f}")
+        self._deadline = time.perf_counter() + iti_s
+        self._log("ITI", f"{iti_s:.1f}s")
 
-    def _start_precue(self):
-        dur = self.params["precue_ms"] / 1000.0
-        self._deadline = self._state_start + dur
+    def _start_trial(self):
+        self._trial_start_mono = time.perf_counter()
+        cue_ms = self.params["cue_duration_ms"]
+        reward_ms = self.params["reward_dose_ms"]
+        window_ms = self.params["window_duration_ms"]
 
-    def _start_cue(self):
-        self._dev.write("CUE")
-        self._trial_cue_time = time.perf_counter()
-        dur = self.params["cue_duration_ms"] / 1000.0
-        self._deadline = self._state_start + dur
-        self._log("CUE", str(self.params["cue_duration_ms"]))
+        # 播放 8kHz cue（每次都播）
+        threading.Thread(target=self._play_cue, args=(cue_ms,), daemon=True).start()
 
-    def _start_window(self):
-        dur = self.params["window_duration_ms"]
-        reward = self.params["reward_dose_ms"]
-        self._dev.write(f"WINDOW {int(dur)} {int(reward)}")
+        # 智能补水：上次 MISS → 水嘴还有水，不泵
+        if self._prev_missed:
+            self._log("TRIAL_START", f"cue={cue_ms}ms,water=SKIP(prev_missed)")
+        else:
+            try:
+                self._dev.write(f"WATER {int(reward_ms)}")
+                self._log("TRIAL_START", f"cue={cue_ms}ms,water={reward_ms}ms")
+            except Exception as e:
+                self._log("TRIAL_ERR", f"water_cmd_failed: {e}")
+                self.stop()
+                return
 
-    def _start_post_reward(self):
-        dur = self.params["post_reward_ms"] / 1000.0
-        self._deadline = self._state_start + dur
+        self._deadline = time.perf_counter() + window_ms / 1000.0
+
+    def _play_cue(self, duration_ms):
+        try:
+            import winsound
+            winsound.Beep(8000, int(duration_ms))
+        except Exception:
+            pass
+
+    # ── 定时 ──────────────────────────────────────────
 
     def _check_deadline(self):
         if self._deadline == 0.0:
             return
-        now = time.perf_counter()
-        if now < self._deadline:
+        if time.perf_counter() < self._deadline:
             return
-
         if self.state == State.ITI:
-            if self.params["precue_ms"] > 0:
-                self._transition(State.PRECUE)
-            else:
-                self._transition(State.CUE)
-
-        elif self.state == State.PRECUE:
-            self._transition(State.CUE)
-
-        elif self.state == State.CUE:
-            self._transition(State.WINDOW)
-
-        elif self.state == State.POST_REWARD:
-            self._complete_trial()
+            self._transition(State.TRIAL)
+        elif self.state == State.TRIAL:
+            if len(self._trial_lick_times) == 0:
+                self._log("TRIAL_TIMEOUT", str(self._trial_num))
             self._transition(State.ITI)
 
     def _check_session_timeout(self):
-        if self._session_start is None:
-            return
-        elapsed = time.time() - self._session_start
+        elapsed = time.perf_counter() - self._session_mono_start
         if elapsed >= self.params["session_timeout_s"]:
             self._log("SESSION_END", "TIMEOUT")
             self.stop()
 
-    def _complete_trial(self):
-        self._finish_trial()
-
-    def _finish_trial(self):
-        result = TrialResult(
-            trial_num=self._trial_num,
-            outcome=self._current_outcome.name,
-            iti_s=round(self._iti_duration, 2),
-            cue_time=self._trial_cue_time,
-            lick_time=self._trial_lick_time,
-            reward_time=self._trial_reward_time,
-        )
-        self._log("TRIAL_END", f"{result.outcome}")
-        if self.on_trial_complete:
-            self.on_trial_complete(result)
+    # ── 辅助 ──────────────────────────────────────────
 
     def _log(self, event: str, value: str):
-        mono = time.perf_counter()
         self._events.put(("host", "protocol", event, value))
 
     def _notify_state(self):
@@ -285,6 +222,7 @@ class ProtocolEngine:
 
     def _state_info(self) -> dict:
         remaining = max(0.0, self._deadline - time.perf_counter()) if self._deadline else 0.0
+        skip_next = "跳过泵" if self._prev_missed else "正常"
         return {
             "state": self.state.value,
             "trial_num": self._trial_num,
@@ -292,7 +230,7 @@ class ProtocolEngine:
             "total_licks": self._total_licks,
             "total_rewards": self._total_rewards,
             "total_missed": self._total_missed,
-            "current_outcome": self._current_outcome.name,
             "remaining_s": round(remaining, 1),
             "iti_duration_s": round(self._iti_duration, 1),
+            "smart_water": skip_next,
         }

@@ -1,10 +1,8 @@
 {
   "protocol": {
     "cue_duration_ms": 80,
-    "precue_ms": 200,
-    "window_duration_ms": 3000,
+    "window_duration_ms": 2000,
     "reward_dose_ms": 400,
-    "post_reward_ms": 500,
     "iti_min_s": 20,
     "iti_max_s": 60,
     "max_trials": 200,

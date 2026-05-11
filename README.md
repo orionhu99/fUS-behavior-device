@@ -3,12 +3,12 @@
 整合式头部固定小鼠行为实验控制装置，兼容单光子/双光子/fUS 成像。
 
 核心功能：
-- **Cue-触发式给水协议**：8kHz cue → 舔水检测窗 → 舔即给水 / 超时跳过 → ITI
-- **电容舔水检测**（MPR121），舔→给水在 Nano 上自治闭环（<1ms 延迟）
-- **TTL 输出**：reward / lick / sync / cue，对接成像采集系统
-- **USB 摄像头录像 + 帧时间戳**，可与 TTL 事件对齐
+- **Cue-给水同步协议**：8kHz cue（PC 3.5mm 音响）+ 给水同时触发 → 2s 舔水窗 → 舔即记录 / 超时 MISS → 随机 ITI
+- **电容舔水检测**（MPR121），直接寄存器读写，MDEBUG/THR 命令可调灵敏度
+- **TTL 输出**：reward / lick / sync，对接成像采集系统
+- **USB 摄像头录像 + 帧时间戳**，预览/录像独立切换，协议运行时自动录像
 - **模块化水嘴支架**，预留食槽替换接口
-- **PC 端 GUI**：参数设置、协议控制、舔水时间线可视化、事件日志
+- **PC 端 GUI**：参数设置、协议控制、时间轴舔水图表、事件日志
 
 ## File layout
 
@@ -555,13 +555,13 @@ recordings/
 
 ---
 
-## Bpod HiFi cue
+## 8kHz Cue 声音
 
-1. 确认 HiFi 模块为 `HiFi1`
-2. 接线：`Water Nano D11 → Bpod BNC1 input`
-3. 在 Bpod MATLAB 中运行 `ExternalCueHiFi8kHz`
+**主方案**：PC 3.5mm 音频口 → 有源音箱。协议进入 CUE 阶段时自动播放 8kHz 纯音（WAV 生成 + winsound 播放），无需 Bpod/HiFi 模块。
 
-备选：GUI 中勾选 "PC 8kHz" 复选框，用 PC 声卡替代 Bpod（增加 ~5-20ms 抖动，仅调试用）。
+手动测试：GUI "手动控制" 面板勾选 "PC 8kHz"，点"给水"时同步播放 cue 音。
+
+> 如需 Bpod/HiFi 方案（更低延迟），D11 cue TTL 仍然保留，可接 Bpod BNC1 输入，运行 `bpod/ExternalCueHiFi8kHz/ExternalCueHiFi8kHz.m`。PC 音频和 TTL cue 可同时工作互不冲突。
 
 ---
 
@@ -600,7 +600,8 @@ recordings/
 | 蠕动泵 + MOSFET 驱动 | 外部电源供电 |
 | 步进电机 + 驱动板 | TB6600/DM 系列 |
 | 手动 Z 台 + 电机滑台 | 水嘴微调 |
-| Bpod + HiFi 模块 | 8kHz cue 播放 |
+| 有源音箱 | PC 3.5mm 音频口连接 |
+| Bpod + HiFi 模块（可选） | 低延迟 cue 播放备选 |
 | USB 摄像头 | OpenCV 兼容 |
 | 光学平台 | 面包板，M6 或 1/4"-20 孔距 |
 | 3D 打印件 | 如上表 |
