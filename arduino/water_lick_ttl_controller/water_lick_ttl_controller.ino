@@ -17,13 +17,16 @@ const byte lickElectrode = 0;
 
 unsigned long doseMs = 400;
 unsigned long ttlPulseMs = 10;
-unsigned long lickRefractoryMs = 40;
+unsigned long lickRefractoryMs = 200;
+unsigned long lickReleaseMs = 120;   //舔水触发后必须等到舌头离开水嘴（信号回基线）且经过lickReleaseMs，才能识别下一次舔水
 unsigned long syncIntervalMs = 1000;
 
 bool pumpRunning = false;
 bool autoMode = false;
 bool mpr121Ready = false;
 bool lastTouched = false;
+bool lickLatched = false;      // 已触发本次舔水，等待释放后重置
+unsigned long lastReleaseAt = 0;
 
 // 窗口模式：cue 触发后进入自治舔水检测窗
 bool windowMode = false;
@@ -175,21 +178,29 @@ void readButton() {
 void readLick(unsigned long now) {
   if (!mpr121Ready) return;
 
-  // 软件舔水检测：用 filtered 变化代替硬件 touched 位
   int filtered = cap.filteredData(lickElectrode);
   if (filtered < 0) filtered = 0;
 
-  // 指数移动平均基线
+  // 缓慢指数移动平均基线
   static float swBaseline = -1;
   if (swBaseline < 0) swBaseline = (float)filtered;
-  swBaseline = swBaseline * 0.995 + filtered * 0.005;
+  swBaseline = swBaseline * 0.998 + filtered * 0.002;
 
-  // 触碰使 filtered 下降（电容被人体泄放）
   int delta = (int)(swBaseline - filtered);
-  bool isTouched = (delta >= 6);   // 变化 ≥4 视为舔水
+  bool isTouched = (delta >= 4);
 
-  if (isTouched && !lastTouched && now - lastLickAt >= lickRefractoryMs) {
+  // 检测释放：信号回到基线附近，且充分释放后允许再次触发
+  if (!isTouched && lastTouched) {
+    lastReleaseAt = now;
+    if (lickLatched && (now - lastLickAt >= lickReleaseMs)) {
+      lickLatched = false;
+    }
+  }
+
+  // 新舔水：首次越过阈值 + 未锁存 + 超过不应期
+  if (isTouched && !lickLatched && (now - lastLickAt >= lickRefractoryMs)) {
     lastLickAt = now;
+    lickLatched = true;
     pulseLickTtl(now);
     logEvent("LICK", String(lickElectrode));
     if (windowMode && !windowRewarded) {

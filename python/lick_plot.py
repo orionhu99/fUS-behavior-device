@@ -1,34 +1,41 @@
 """嵌入式 matplotlib 舔水时间线图表。
 
-在 tkinter 中显示：
-- 上方：试次栅格图（trial × time），显示 cue、舔水、给水事件
-- 下方：累积舔水直方图（按试次）
+在 tkinter 中显示试次栅格图（trial × time），cue/舔/给水事件。
 """
 
 from collections import deque
 
 import matplotlib
 matplotlib.use("TkAgg")
+import matplotlib.font_manager as fm
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
+# 中文字体
+_SYS_FONT = None
+for name in ["Microsoft YaHei", "SimHei", "WenQuanYi Micro Hei", "Noto Sans CJK SC"]:
+    for f in fm.fontManager.ttflist:
+        if f.name == name:
+            _SYS_FONT = f.name
+            break
+    if _SYS_FONT:
+        break
+if _SYS_FONT:
+    matplotlib.rcParams["font.family"] = _SYS_FONT
+matplotlib.rcParams["axes.unicode_minus"] = False
+
 
 class LickPlot:
-    """舔水时间线可视化。"""
+    """舔水时间线可视化——每个试次一行，实时更新。"""
 
-    def __init__(self, parent, max_trials_display=40):
-        self._trials = deque(maxlen=max_trials_display)
-        self._fig = Figure(figsize=(8, 2.5), dpi=100)
-        self._fig.tight_layout(pad=2.0)
+    def __init__(self, parent, max_trials=60):
+        self._trials = deque(maxlen=max_trials)
+        self._fig = Figure(figsize=(7, 2.2), dpi=96)
+        self._fig.set_tight_layout(True)
 
-        gs = self._fig.add_gridspec(2, 1, height_ratios=[2, 1], hspace=0.35)
-        self._ax_raster = self._fig.add_subplot(gs[0, 0])
-        self._ax_hist = self._fig.add_subplot(gs[1, 0])
-
-        self._ax_raster.set_ylabel("试次")
-        self._ax_raster.set_xlabel("试次内时间 (s)")
-        self._ax_hist.set_ylabel("累积")
-        self._ax_hist.set_xlabel("试次号")
+        self._ax = self._fig.add_subplot(111)
+        self._ax.set_xlabel("以 cue 为 0 的时间 (s)")
+        self._ax.set_ylabel("试次")
 
         self._canvas = FigureCanvasTkAgg(self._fig, master=parent)
         self._canvas_widget = self._canvas.get_tk_widget()
@@ -37,12 +44,8 @@ class LickPlot:
     def widget(self):
         return self._canvas_widget
 
-    def add_trial(self, trial_result):
-        """添加一个完成的试次数据。
-
-        trial_result: TrialResult namedtuple
-        """
-        self._trials.append(trial_result)
+    def add_trial(self, result):
+        self._trials.append(result)
         self._redraw()
 
     def clear(self):
@@ -50,70 +53,54 @@ class LickPlot:
         self._redraw()
 
     def _redraw(self):
-        self._ax_raster.clear()
-        self._ax_hist.clear()
-
+        self._ax.clear()
         if not self._trials:
             self._canvas.draw()
             return
 
-        # 构建栅格图数据
         n = len(self._trials)
+        offset = max(t.lick_time - t.cue_time if (t.cue_time and t.lick_time) else 5.0
+                     for t in self._trials)
+        xlim = (-1.0, offset + 2.0)
+        self._ax.set_xlim(*xlim)
+        self._ax.set_ylim(0.3, n + 0.7)
+
         y_labels = []
-        cue_times = []
-        lick_times = []
-        reward_times = []
-        outcomes = []
+        min_t = None
 
         for i, t in enumerate(self._trials):
-            y = n - i  # 最新试次在顶部
+            y = n - i
             y_labels.append(str(t.trial_num))
-            outcomes.append(t.outcome)
+            ref = t.cue_time
 
-            if t.cue_time is not None:
-                # 计算相对时间（以 cue 为 0）
-                ref = t.cue_time
-                cue_times.append((y, 0.0))
+            if ref is not None:
+                if min_t is None:
+                    min_t = ref
+                # cue 线
+                self._ax.axhline(y=y, color="#e0e0e0", linewidth=0.5, zorder=0)
+                # lick 点
                 if t.lick_time is not None:
-                    lick_times.append((y, t.lick_time - ref))
+                    offset_s = t.lick_time - ref
+                    c = "#2ecc71" if t.outcome == "REWARDED" else "#e67e22"
+                    self._ax.plot(offset_s, y, "o", color=c, markersize=5, zorder=3)
+                # reward 点
                 if t.reward_time is not None:
-                    reward_times.append((y, t.reward_time - ref))
+                    offset_s = t.reward_time - ref
+                    self._ax.plot(offset_s, y, "D", color="#e74c3c", markersize=5, zorder=4)
 
-        # 栅格图
-        for y, x in cue_times:
-            self._ax_raster.axvline(x=0, color="gray", alpha=0.3, linewidth=0.5)
-            self._ax_raster.plot(x, y, "b|", markersize=8, label="Cue" if y == n else "")
+        # cue 参考线
+        self._ax.axvline(x=0, color="#3498db", alpha=0.25, linewidth=2, zorder=2)
 
-        for y, x in lick_times:
-            color = "green" if outcomes[n - y] == "REWARDED" else "orange"
-            self._ax_raster.plot(x, y, "o", color=color, markersize=4, alpha=0.8)
-
-        for y, x in reward_times:
-            self._ax_raster.plot(x, y, "r*", markersize=6)
-
-        self._ax_raster.set_yticks(range(1, n + 1))
-        self._ax_raster.set_yticklabels(y_labels, fontsize=7)
-        self._ax_raster.set_ylim(0.5, n + 0.5)
-        self._ax_raster.axvline(x=0, color="blue", alpha=0.15, linewidth=3)
-
-        # 累积直方图
-        rewarded_count = sum(1 for t in self._trials if t.outcome == "REWARDED")
-        missed_count = sum(1 for t in self._trials if t.outcome == "MISSED")
-
-        trial_nums = [t.trial_num for t in self._trials]
-        cum_rewarded = []
-        cum = 0
-        for t in self._trials:
-            if t.outcome == "REWARDED":
-                cum += 1
-            cum_rewarded.append(cum)
-
-        x_range = max(1, len(self._trials))
-        self._ax_hist.plot(
-            range(1, len(self._trials) + 1), cum_rewarded,
-            "g-", linewidth=2, label=f"给水={rewarded_count}"
-        )
-        self._ax_hist.set_xlim(0.5, x_range + 0.5)
-        self._ax_hist.legend(fontsize=7, loc="upper left")
+        self._ax.set_yticks(range(1, n + 1))
+        self._ax.set_yticklabels(y_labels, fontsize=6)
+        # 空图例做标识
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="#2ecc71", markersize=6, label="舔+奖励"),
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="#e67e22", markersize=6, label="舔+错过"),
+            Line2D([0], [0], marker="D", color="w", markerfacecolor="#e74c3c", markersize=6, label="给水时刻"),
+        ]
+        self._ax.legend(handles=legend_elements, fontsize=6, loc="upper right",
+                        ncol=3, framealpha=0.5)
 
         self._canvas.draw()

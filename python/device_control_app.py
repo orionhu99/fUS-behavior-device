@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+# 中文字体（tkinter 默认在 Windows 上支持中文，matplotlib 在 lick_plot 中配置）
+
 try:
     import cv2
 except ImportError:
