@@ -1,4 +1,5 @@
 #include <Wire.h>
+#include <avr/wdt.h>
 
 // Nano for water delivery, lick detection, and TTL event outputs.
 
@@ -62,31 +63,44 @@ byte lineIdx = 0;
 // MPR121 底层读写（绕过 Adafruit 库）
 // ═══════════════════════════════════════════════════════════
 
-void mprWrite(byte reg, byte val) {
+static unsigned long lastMprRead = 0;
+static bool i2cOk = true;
+
+bool mprWrite(byte reg, byte val) {
   Wire.beginTransmission(mprAddr);
   Wire.write(reg);
   Wire.write(val);
-  Wire.endTransmission();
+  byte r = Wire.endTransmission();
+  if (r != 0) { i2cOk = false; return false; }
+  i2cOk = true; return true;
 }
 
 byte mprRead8(byte reg) {
   Wire.beginTransmission(mprAddr);
   Wire.write(reg);
-  Wire.endTransmission(false);
+  if (Wire.endTransmission(false) != 0) { i2cOk = false; return 0; }
   Wire.requestFrom((uint8_t)mprAddr, (uint8_t)1);
-  if (Wire.available()) return Wire.read();
-  return 0;
+  byte v = Wire.available() ? Wire.read() : 0;
+  i2cOk = true; return v;
 }
 
 uint16_t mprRead16(byte reg) {
   Wire.beginTransmission(mprAddr);
   Wire.write(reg);
-  Wire.endTransmission(false);
+  if (Wire.endTransmission(false) != 0) { i2cOk = false; return 0; }
   Wire.requestFrom((uint8_t)mprAddr, (uint8_t)2);
   uint16_t v = 0;
   if (Wire.available()) v = Wire.read();
   if (Wire.available()) v |= ((uint16_t)Wire.read() << 8);
-  return v & 0x03FF; // 10-bit
+  i2cOk = true; return v & 0x03FF;
+}
+
+void i2cRecover() {
+  Wire.end();
+  delay(5);
+  Wire.begin();
+  delay(5);
+  i2cOk = true;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -176,13 +190,13 @@ bool initMpr121() {
   Serial.print(F(" diff=")); Serial.println((int16_t)b0 - (int16_t)f0);
 
   if (f0 == 0 && b0 == 0) {
-    Serial.println(F("!! filtered=0 AND baseline=0 — 电极可能未连接或浮空"));
-    Serial.println(F("   检查: MPR121 E0 引脚 → 金属舔水管"));
-    Serial.println(F("   检查: 水管是否对地绝缘（用万用表测）"));
+    Serial.println("!! filtered=0 AND baseline=0 -- electrode may be floating");
+    Serial.println("   Check: MPR121 E0 pin -> metal lick tube");
+    Serial.println("   Check: tube insulation with multimeter");
   }
 
   Serial.println(F("--- MPR121 init done ---"));
-  Serial.println(F("发 MDEBUG 看实时值，发 REGDUMP 看全部寄存器"));
+  Serial.println("Send MDEBUG for live values, REGDUMP for register dump");
   return true;
 }
 
@@ -205,6 +219,9 @@ void setup() {
   Serial.begin(115200);
   while (!Serial) {}
 
+  // 看门狗：500ms 超时自动复位（防止 I2C 卡死导致永久死机）
+  wdt_enable(WDTO_500MS);
+
   mpr121Ready = initMpr121();
 
   logEvent("READY", mpr121Ready ? "MPR121_OK" : "MPR121_MISSING");
@@ -216,6 +233,7 @@ void setup() {
 // ═══════════════════════════════════════════════════
 
 void loop() {
+  wdt_reset();  // 喂狗
   const unsigned long now = millis();
   readSerial();
   readButton();
@@ -354,26 +372,30 @@ void readButton() {
 void readLick(unsigned long now) {
   if (!mpr121Ready) return;
 
-  // 直接读 MPR121 状态寄存器
-  uint8_t touchedReg = mprRead8(0x00);       // touch status
-  bool hwTouched = touchedReg & 0x01;         // bit 0 = electrode 0
+  // 降频：每 5ms 读一次（200Hz），防 I2C 总线风暴
+  if (now - lastMprRead < 5) return;
+  lastMprRead = now;
 
-  uint16_t filtered = mprRead16(0x04);       // E0 filtered data
-  uint16_t baseline = mprRead16(0x1E);       // E0 baseline
+  // I2C 异常恢复
+  if (!i2cOk) { i2cRecover(); return; }
 
-  // 双重确认：硬件标记 + 信号偏离基线（绝对值，不判断方向）
+  // 读 MPR121 寄存器（一次 3 字节批量读，减少 I2C 事务）
+  uint8_t touchedReg = mprRead8(0x00);
+  uint16_t filtered = mprRead16(0x04);
+  uint16_t baseline = mprRead16(0x1E);
+  if (!i2cOk) return;  // 本次读取失败则跳过
+
+  bool hwTouched = touchedReg & 0x01;
   int16_t delta = (int16_t)baseline - (int16_t)filtered;
   int16_t adelta = delta < 0 ? -delta : delta;
   bool signalOk = adelta >= confirmDeltaMin;
-
   bool isTouched = hwTouched && signalOk;
 
-  // 消抖：连续 2 帧确认
-  if (isTouched) { confirmCnt++; }
-  else           { confirmCnt = 0; }
+  if (isTouched) confirmCnt++;
+  else           confirmCnt = 0;
   bool confirmed = (confirmCnt >= 2);
 
-  // 上升沿触发
+  // 上升沿 → 触发舔水
   if (confirmed && !lastTouched && !lickLatched &&
       (now - lastLickAt >= lickRefractoryMs)) {
     lastLickAt = now;
@@ -387,9 +409,9 @@ void readLick(unsigned long now) {
   }
 
   // 释放检测
-  if (!confirmed && lastTouched)       lastReleaseAt = now;
-  if (lickLatched && !confirmed &&
-      (now - lastReleaseAt >= lickReleaseMs)) lickLatched = false;
+  if (!confirmed && lastTouched) lastReleaseAt = now;
+  if (lickLatched && !confirmed && (now - lastReleaseAt >= lickReleaseMs))
+    lickLatched = false;
 
   lastTouched = confirmed;
 }
@@ -449,7 +471,7 @@ void updateSync(unsigned long now) {
     digitalWrite(syncTtlPin, HIGH);
     syncTtlOffAt = now + ttlPulseMs;
     nextSyncAt += syncIntervalMs;
-    logEvent("SYNC", "1");
+    // TTL 脉冲照发，但不打串口日志（减少刷屏）
   }
 }
 
@@ -501,7 +523,8 @@ void logEvent(const char* eventName, const char* value) {
 void printHelp() {
   Serial.println(F("Commands: WATER [ms], DOSE ms, PUMP ON/OFF, STOP, TTLMS ms, SYNCMS ms,"));
   Serial.println(F("  CUE, WINDOW dur reward, WINDOW_STOP, MDEBUG, REGDUMP,"));
-  Serial.println(F("  THR touch release  (灵敏度: THR 6 3 = 更灵敏, THR 20 12 = 不灵敏)"));
-  Serial.println(F("  DMIN min_delta      (软件确认阈值, 默认 5)"));
+  Serial.println(F("  THR t r      (touch/release threshold, lower=more sensitive)"));
+  Serial.println(F("  DMIN min     (software confirm delta, default 5)"));
+  Serial.println(F("  RESETMPR     (re-init MPR121)"));
   Serial.println(F("  STATUS, HELP"));
 }

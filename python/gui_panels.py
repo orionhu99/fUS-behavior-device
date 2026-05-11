@@ -381,45 +381,49 @@ class ProtocolPanel(ttk.LabelFrame):
 
 class StatusPanel(ttk.LabelFrame):
     def __init__(self, parent):
-        super().__init__(parent, text="状态", padding=4)
+        super().__init__(parent, text="状态", padding=6)
+        self._labels = {}
         self._build()
 
     def _build(self):
-        self._vars = {}
+        FONT = ("", 10)
+        FONT_VAL = ("", 10, "bold")
+
         items = [
-            ("water",   "Water Nano",  "○ 未连接"),
-            ("motor",   "Motor Nano",  "○ 未连接"),
-            ("camera",  "摄像头",       "○ 未启动"),
-            ("mpr121",  "MPR121",       "--"),
-            ("pump",    "泵",           "○ 停止"),
-            ("lick",    "最后舔水",      "--"),
-            ("water_ev","最后给水",      "--"),
-            ("state",   "协议状态",      "IDLE"),
-            ("trial",   "当前试次",      "0"),
+            ("water", 3, 0, "Water Nano",  "○ 未连接"),
+            ("motor", 3, 1, "Motor Nano",  "○ 未连接"),
+            ("cam",   4, 0, "摄像头",       "○ 未启动"),
+            ("mpr",   4, 1, "MPR121",       "--"),
+            ("pump",  5, 0, "泵",           "○ 停止"),
+            ("lick",  5, 1, "最后舔水",      "--"),
+            ("state", 3, 2, "协议",          "IDLE"),
+            ("trial", 4, 2, "试次",          "0"),
+            ("smart", 5, 2, "下次补水",      "正常"),
         ]
-        for i, (key, label, default) in enumerate(items):
-            col = i % 3
-            row = i // 3
-            ttk.Label(self, text=label + ":", font=("", 8)).grid(row=row, column=col*2, sticky="e", padx=1, pady=1)
-            var = tk.StringVar(value=default)
-            self._vars[key] = var
-            ttk.Label(self, textvariable=var, font=("", 8, "bold")).grid(row=row, column=col*2+1, sticky="w", padx=1, pady=1)
+        for key, r, c, label, default in items:
+            ttk.Label(self, text=label, font=FONT).grid(row=r, column=c*2, sticky="e", padx=2, pady=3)
+            val = tk.Label(self, text=default, font=FONT_VAL, fg="gray", anchor="w")
+            val.grid(row=r, column=c*2+1, sticky="w", padx=2, pady=3)
+            self._labels[key] = val
 
-    def update(self, key: str, value: str):
-        if key in self._vars:
-            self._vars[key].set(value)
+    def _set(self, key, text, color="gray"):
+        if key in self._labels:
+            self._labels[key].config(text=text, fg=color)
 
-    def set_water_connected(self):  self.update("water", "● 已连接")
-    def set_water_disconnected(self): self.update("water", "○ 未连接")
-    def set_motor_connected(self):  self.update("motor", "● 已连接")
-    def set_motor_disconnected(self): self.update("motor", "○ 未连接")
-    def set_mpr121(self, ok: bool): self.update("mpr121", "● 正常" if ok else "○ 未检测")
-    def set_pump(self, on: bool):   self.update("pump", "● 运行" if on else "○ 停止")
-    def set_camera(self, mode: str): self.update("camera", mode)
-    def set_lick(self, tm: str):    self.update("lick", tm)
-    def set_water_ev(self, tm: str): self.update("water_ev", tm)
-    def set_state(self, s: str):    self.update("state", s)
-    def set_trial(self, n: str):    self.update("trial", n)
+    def set_water_connected(self):  self._set("water", "● 已连接", "#2E7D32")
+    def set_water_disconnected(self): self._set("water", "○ 未连接", "gray")
+    def set_motor_connected(self):  self._set("motor", "● 已连接", "#2E7D32")
+    def set_motor_disconnected(self): self._set("motor", "○ 未连接", "gray")
+    def set_mpr121(self, ok):       self._set("mpr", "● 正常" if ok else "○ 未检测", "#2E7D32" if ok else "red")
+    def set_pump(self, on):         self._set("pump", "● 运行" if on else "○ 停止", "#1565C0" if on else "gray")
+    def set_camera(self, s):        self._set("cam", s, "#1565C0")
+    def set_lick(self, tm):         self._set("lick", tm, "#4CAF50")
+    def set_water_ev(self, tm):     self._set("water_ev", tm, "#1565C0")
+    def set_state(self, s):         self._set("state", s, "#1565C0" if s not in ("IDLE",) else "gray")
+    def set_trial(self, n):         self._set("trial", n, "black")
+    def set_smart_water(self, s):   self._set("smart", s, "#E65100" if "跳过" in s else "gray")
+
+    def update(self, key, value):   self._set(key, value)
 
 
 # ═══════════════════════════════════════════════════════════

@@ -1,8 +1,4 @@
-"""fUS 行为装置控制 —— 主应用。
-
-整合：双 Nano 串口、USB 摄像头、Cue-触发式给水协议引擎、
-舔水时间线可视化、事件日志 CSV 记录。
-"""
+"""fUS behavior device control - main application."""
 
 import csv
 import queue
@@ -297,11 +293,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("fUS behavior device control")
         self.geometry("1040x720")
-        self.minsize(800, 500)
-
-        # 根窗口自适应
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
+        self.minsize(860, 620)
 
         # 共享队列
         self.events = queue.Queue()
@@ -310,6 +302,10 @@ class App(tk.Tk):
         self.water = SerialDevice("water", self.events)
         self.spout_motor = SerialDevice("spout_motor", self.events)
         self.video = VideoRecorder(self.events)
+
+        # 心跳检测
+        self._last_water_rx = time.perf_counter()
+        self._reconnecting = False
 
         # 协议引擎
         self.protocol_engine = ProtocolEngine(self.water, self.events)
@@ -331,66 +327,59 @@ class App(tk.Tk):
         self.protocol_engine.on_state_changed = self._combined_state_changed
 
         # 定时器
-        self.after(50, self._drain_events)
+        self.after(15, self._drain_events)
         self.after(20, self._tick_protocol)
+        self.after(500, self._refresh_plot)
+        self.after(3000, self._heartbeat)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
-        # 根窗口自适应权重
+        # 根窗口权重
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        # ── 垂直分隔：中部可伸缩区 + 底部日志 ──
-        vpane = ttk.PanedWindow(self, orient="vertical")
-        vpane.grid(row=0, column=0, sticky="nsew", padx=8, pady=4)
+        # ── 垂直主分隔 ──
+        main_v = ttk.PanedWindow(self, orient="vertical")
+        main_v.grid(row=0, column=0, sticky="nsew", padx=6, pady=4)
 
-        # 顶部：连接面板（固定）
+        # ① 连接
         self.conn_panel = ConnectionPanel(
-            vpane, self.water, self.spout_motor, self.video, self.output_dir
+            main_v, self.water, self.spout_motor, self.video, self.output_dir
         )
         self.conn_panel._ensure_log = self._ensure_log
 
-        # 状态面板
-        self.status_panel = StatusPanel(vpane)
+        # ② 水平分隔：控制+电机 | Task
+        top_h = ttk.PanedWindow(main_v, orient="horizontal")
+        ctrl_col = ttk.Frame(top_h)
+        self.manual_panel = ManualControlPanel(ctrl_col, self.water, self.events, tk.BooleanVar(value=False))
+        self.manual_panel.pack(fill="x", pady=1)
+        self.motor_panel = MotorControlPanel(ctrl_col, self.spout_motor)
+        self.motor_panel.pack(fill="x", pady=1)
+        top_h.add(ctrl_col, weight=3)
 
-        # ── 中部：水平分隔 左侧(控制+图表) | 右侧(协议) ──
-        hpane = ttk.PanedWindow(vpane, orient="horizontal")
+        self.protocol_panel = ProtocolPanel(top_h, self.protocol_engine, self.config_mgr)
+        top_h.add(self.protocol_panel, weight=2)
 
-        # 左侧面板
-        left = ttk.Frame(hpane)
-        left.rowconfigure(2, weight=1)
-        left.columnconfigure(0, weight=1)
-
-        self.manual_panel = ManualControlPanel(left, self.water, self.events, tk.BooleanVar(value=False))
-        self.manual_panel.grid(row=0, column=0, sticky="ew", pady=2)
-
-        self.motor_panel = MotorControlPanel(left, self.spout_motor)
-        self.motor_panel.grid(row=1, column=0, sticky="ew", pady=2)
-
-        # 舔水图表
-        plot_frame = ttk.LabelFrame(left, text="舔水时间线")
-        plot_frame.grid(row=2, column=0, sticky="nsew", pady=2)
+        # ③ 时间线
+        plot_frame = ttk.LabelFrame(main_v, text="舔水时间线")
         plot_frame.rowconfigure(0, weight=1)
         plot_frame.columnconfigure(0, weight=1)
         self._lick_plot = LickPlot(plot_frame)
         self._lick_plot.widget.pack(fill="both", expand=True, padx=2, pady=2)
 
-        # 右侧：协议面板
-        self.protocol_panel = ProtocolPanel(hpane, self.protocol_engine, self.config_mgr)
+        # ④ 水平分隔：状态 | 日志
+        bottom_h = ttk.PanedWindow(main_v, orient="horizontal")
+        self.status_panel = StatusPanel(bottom_h)
+        bottom_h.add(self.status_panel, weight=1)
+        self.log_panel = EventLogPanel(bottom_h)
+        bottom_h.add(self.log_panel, weight=2)
 
-        # 添加可拖动的面板
-        hpane.add(left, weight=3)
-        hpane.add(self.protocol_panel, weight=2)
-
-        # ── 底部：事件日志 ──
-        self.log_panel = EventLogPanel(vpane)
-
-        # 组装垂直分隔
-        vpane.add(self.conn_panel, weight=0)
-        vpane.add(self.status_panel, weight=0)
-        vpane.add(hpane, weight=1)
-        vpane.add(self.log_panel, weight=0)
+        # ── 组装 ──
+        main_v.add(self.conn_panel, weight=0)
+        main_v.add(top_h, weight=0)
+        main_v.add(plot_frame, weight=1)
+        main_v.add(bottom_h, weight=0)
 
     # ── 日志 ────────────────────────────────────────
 
@@ -431,26 +420,67 @@ class App(tk.Tk):
 
             # 转发给协议引擎（仅 serial 源事件）
             if source == "serial" and device == "water":
-                # 解析 CSV: arduino_ms,event,value
                 parts = value.split(",")
                 if len(parts) >= 3:
-                    self.protocol_engine.handle_serial_event("water", parts[1], ",".join(parts[2:]))
+                    evt = parts[1].strip()
+                    self.protocol_engine.handle_serial_event("water", evt, ",".join(p.strip() for p in parts[2:]))
 
-        self.after(50, self._drain_events)
+        self.after(15, self._drain_events)
 
     def _tick_protocol(self):
         self.protocol_engine.tick()
         self.after(20, self._tick_protocol)
 
+    def _refresh_plot(self):
+        self._lick_plot.refresh()
+        self.after(500, self._refresh_plot)
+
+    def _heartbeat(self):
+        """每 3s 检测 Water Nano 是否存活，失联则自动重连"""
+        if not self.water.port or not self.water.port.is_open:
+            self._reconnecting = False
+            self.after(3000, self._heartbeat)
+            return
+
+        elapsed = time.perf_counter() - self._last_water_rx
+        if elapsed > 8.0 and not self._reconnecting:
+            # 超过 8s 没收数据 → 尝试重连
+            self._reconnecting = True
+            port = self.water.port.port
+            self.events.put(("host", "water", "HEARTBEAT", "reconnecting"))
+            try:
+                self.water.disconnect()
+                time.sleep(1)
+                self.water.connect(port)
+                self._reconnecting = False
+                self._last_water_rx = time.perf_counter()
+                self.events.put(("host", "water", "HEARTBEAT", "reconnected"))
+            except Exception:
+                self.events.put(("host", "water", "HEARTBEAT", "reconnect_failed"))
+                self._reconnecting = False
+        else:
+            # 存活中，发 STATUS 确认
+            try:
+                self.water.write("STATUS")
+            except Exception:
+                pass
+
+        self.after(3000, self._heartbeat)
+
     def _update_status(self, source, device, event, value):
+        # 记录心跳时间
+        if device == "water" and source == "serial":
+            self._last_water_rx = time.perf_counter()
+
         if device == "water" and event == "CONNECTED":
+            self._last_water_rx = time.perf_counter()
             self.status_panel.set_water_connected()
             if "MPR121_OK" in value:
                 self.status_panel.set_mpr121(True)
         elif device == "water" and event == "RX":
             parts = value.split(",")
             if len(parts) >= 3:
-                evt = parts[1]
+                evt = parts[1].strip()
                 if evt == "LICK" or evt.startswith("WINDOW_LICK"):
                     self.status_panel.set_lick(f"T+{time.perf_counter() - (self.protocol_engine._session_mono_start or 0):.1f}s")
                 elif evt == "WATER" or evt == "WINDOW_REWARD":
@@ -472,11 +502,8 @@ class App(tk.Tk):
         self._on_protocol_state(state, info)
         self.status_panel.set_state(info["state"])
         self.status_panel.set_trial(str(info["trial_num"]))
-        # 泵状态
-        if info["state"] == "TRIAL":
-            self.status_panel.set_pump(True)
-        else:
-            self.status_panel.set_pump(False)
+        self.status_panel.set_pump(info["state"] == "TRIAL")
+        self.status_panel.set_smart_water(info.get("smart_water", "正常"))
 
     def _on_protocol_state(self, state, info):
         from protocol_engine import State

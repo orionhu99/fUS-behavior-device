@@ -14,6 +14,7 @@ TrialResult = namedtuple("TrialResult", [
     "trial_num", "outcome", "iti_s",
     "cue_time", "lick_times",       # 试次内舔水时刻
     "iti_lick_times",               # ITI 期间的舔水时刻
+    "window_s",                     # 舔水窗口时长（秒）
 ])
 
 DEFAULT_PARAMS = {
@@ -53,7 +54,9 @@ class ProtocolEngine:
         self._iti_duration = 0.0
         self._trial_lick_times = []    # 本次 trial 所有舔水时刻
         self._iti_lick_times = []      # 当前 ITI 期间的舔水时刻
+        self._iti_had_lick = False     # 当前 ITI 是否有过舔水
         self._prev_missed = False      # 上次 trial 是否 MISS
+        self._trial_end_mono = 0.0     # 上次 trial 结束时刻（宽容窗口用）
         self._session_mono_start = 0.0
 
         self.on_state_changed = None
@@ -109,10 +112,16 @@ class ProtocolEngine:
 
         if event == "LICK":
             self._total_licks += 1
+            now = time.perf_counter()
             if self.state == State.TRIAL:
-                self._trial_lick_times.append(time.perf_counter())
-            elif self.state == State.ITI:
-                self._iti_lick_times.append(time.perf_counter())
+                self._trial_lick_times.append(now)
+            elif self.state == State.ITI and self._trial_end_mono > 0:
+                # 宽容窗口：试次刚结束时到达的舔水仍计入试次
+                if now - self._trial_end_mono < 0.2:
+                    self._trial_lick_times.append(now)
+                else:
+                    self._iti_lick_times.append(now)
+                    self._iti_had_lick = True
 
     # ── 状态转换 ──────────────────────────────────────
 
@@ -143,6 +152,7 @@ class ProtocolEngine:
                 cue_time=self._trial_start_mono,
                 lick_times=list(self._trial_lick_times),
                 iti_lick_times=list(self._iti_lick_times),
+                window_s=self.params["window_duration_ms"] / 1000.0,
             )
             self._log("TRIAL_END", outcome)
             if self.on_trial_complete:
@@ -170,9 +180,10 @@ class ProtocolEngine:
         # 播放 8kHz cue（每次都播）
         threading.Thread(target=self._play_cue, args=(cue_ms,), daemon=True).start()
 
-        # 智能补水：上次 MISS → 水嘴还有水，不泵
-        if self._prev_missed:
-            self._log("TRIAL_START", f"cue={cue_ms}ms,water=SKIP(prev_missed)")
+        # 智能补水：上次 MISS 且 ITI 没舔 → 水还在，跳过泵
+        skip_water = self._prev_missed and not self._iti_had_lick
+        if skip_water:
+            self._log("TRIAL_START", f"cue={cue_ms}ms,water=SKIP(no_lick_since_last)")
         else:
             try:
                 self._dev.write(f"WATER {int(reward_ms)}")
@@ -181,6 +192,7 @@ class ProtocolEngine:
                 self._log("TRIAL_ERR", f"water_cmd_failed: {e}")
                 self.stop()
                 return
+        self._iti_had_lick = False
 
         self._deadline = time.perf_counter() + window_ms / 1000.0
 
@@ -201,6 +213,7 @@ class ProtocolEngine:
         if self.state == State.ITI:
             self._transition(State.TRIAL)
         elif self.state == State.TRIAL:
+            self._trial_end_mono = time.perf_counter()
             if len(self._trial_lick_times) == 0:
                 self._log("TRIAL_TIMEOUT", str(self._trial_num))
             self._transition(State.ITI)
@@ -222,7 +235,7 @@ class ProtocolEngine:
 
     def _state_info(self) -> dict:
         remaining = max(0.0, self._deadline - time.perf_counter()) if self._deadline else 0.0
-        skip_next = "跳过泵" if self._prev_missed else "正常"
+        skip_next = "跳过泵" if (self._prev_missed and not self._iti_had_lick) else "正常"
         return {
             "state": self.state.value,
             "trial_num": self._trial_num,
