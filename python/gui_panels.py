@@ -19,6 +19,7 @@ class ConnectionPanel(ttk.LabelFrame):
         self.video = video
         self.output_dir = output_dir_var
         self._ensure_log = None  # 由 App 设置
+        self._preview_on = False
         self._build()
 
     def _build(self):
@@ -37,9 +38,11 @@ class ConnectionPanel(ttk.LabelFrame):
         ttk.Button(self, text="连接", command=self._connect_z).grid(row=0, column=5, padx=4)
 
         ttk.Label(self, text="摄像头").grid(row=1, column=0, sticky="w", padx=4, pady=4)
-        ttk.Entry(self, textvariable=self.camera_index, width=8).grid(row=1, column=1, sticky="w", padx=4)
-        ttk.Button(self, text="开始录像", command=self._start_video).grid(row=1, column=2, padx=4)
-        ttk.Button(self, text="停止", command=self.video.stop).grid(row=1, column=3, padx=4)
+        ttk.Entry(self, textvariable=self.camera_index, width=6).grid(row=1, column=1, sticky="w", padx=4)
+        self._btn_preview = ttk.Button(self, text="预览", command=self._toggle_preview)
+        self._btn_preview.grid(row=1, column=2, padx=4)
+        self._btn_record = ttk.Button(self, text="录像", command=self._toggle_recording)
+        self._btn_record.grid(row=1, column=3, padx=4)
         ttk.Button(self, text="保存目录", command=self._choose_folder).grid(row=1, column=4, padx=4)
 
     def _list_ports(self):
@@ -58,10 +61,31 @@ class ConnectionPanel(ttk.LabelFrame):
         if self._ensure_log:
             self._ensure_log()
 
-    def _start_video(self):
-        if self._ensure_log:
-            self._ensure_log()
-        self.video.start(self.camera_index.get(), self.output_dir.get())
+    def _toggle_preview(self):
+        if self._preview_on:
+            self.video.stop_preview()
+            self._preview_on = False
+            self._btn_preview.config(text="预览")
+        else:
+            try:
+                self.video.start_preview(self.camera_index.get())
+                self._preview_on = True
+                self._btn_preview.config(text="关闭预览")
+            except Exception as exc:
+                messagebox.showerror("预览失败", str(exc))
+
+    def _toggle_recording(self):
+        if self.video.recording:
+            self.video.stop_recording()
+            self._btn_record.config(text="录像")
+        else:
+            try:
+                if self._ensure_log:
+                    self._ensure_log()
+                self.video.start_recording(self.camera_index.get(), self.output_dir.get())
+                self._btn_record.config(text="停止录像")
+            except Exception as exc:
+                messagebox.showerror("录像失败", str(exc))
 
     def _choose_folder(self):
         folder = filedialog.askdirectory()
@@ -70,7 +94,6 @@ class ConnectionPanel(ttk.LabelFrame):
 
     def refresh_ports(self):
         ports = self._list_ports()
-        # Combobox values 无法直接更新，通过子级遍历
         for child in self.winfo_children():
             if isinstance(child, ttk.Combobox):
                 child["values"] = ports
@@ -134,6 +157,7 @@ class MotorControlPanel(ttk.LabelFrame):
     def __init__(self, parent, spout_dev):
         super().__init__(parent, text="电机控制")
         self.spout = spout_dev
+        self.spout_connected = False
         self._build()
 
     def _build(self):
@@ -141,29 +165,41 @@ class MotorControlPanel(ttk.LabelFrame):
         self.large_step = tk.StringVar(value="500")
         self.speed_us = tk.StringVar(value="2000")
 
-        ttk.Label(self, text="小步").grid(row=0, column=0, padx=4, pady=4)
-        ttk.Entry(self, textvariable=self.small_step, width=8).grid(row=0, column=1, padx=4)
-        ttk.Button(self, text="↑", command=lambda: self._step(self.small_step.get())).grid(row=0, column=2, padx=2)
-        ttk.Button(self, text="↓", command=lambda: self._step("-" + self.small_step.get())).grid(row=0, column=3, padx=2)
+        # 连接状态指示
+        self._status_label = ttk.Label(self, text="● 未连接", foreground="red")
+        self._status_label.grid(row=0, column=0, columnspan=7, sticky="w", padx=4, pady=2)
 
-        ttk.Label(self, text="大步").grid(row=1, column=0, padx=4, pady=4)
-        ttk.Entry(self, textvariable=self.large_step, width=8).grid(row=1, column=1, padx=4)
-        ttk.Button(self, text="↑", command=lambda: self._step(self.large_step.get())).grid(row=1, column=2, padx=2)
-        ttk.Button(self, text="↓", command=lambda: self._step("-" + self.large_step.get())).grid(row=1, column=3, padx=2)
+        ttk.Label(self, text="小步").grid(row=1, column=0, padx=4, pady=4)
+        ttk.Entry(self, textvariable=self.small_step, width=8).grid(row=1, column=1, padx=4)
+        ttk.Button(self, text="↑", command=lambda: self._step(self.small_step.get())).grid(row=1, column=2, padx=2)
+        ttk.Button(self, text="↓", command=lambda: self._step("-" + self.small_step.get())).grid(row=1, column=3, padx=2)
 
-        ttk.Label(self, text="速度 μs").grid(row=0, column=4, padx=4)
-        ttk.Entry(self, textvariable=self.speed_us, width=8).grid(row=0, column=5, padx=4)
-        ttk.Button(self, text="设定", command=self._set_speed).grid(row=0, column=6, padx=4)
-        ttk.Button(self, text="停止", command=lambda: self._cmd("STOP")).grid(row=1, column=4, padx=2)
-        ttk.Button(self, text="归零", command=lambda: self._cmd("ZERO")).grid(row=1, column=5, padx=2)
+        ttk.Label(self, text="大步").grid(row=2, column=0, padx=4, pady=4)
+        ttk.Entry(self, textvariable=self.large_step, width=8).grid(row=2, column=1, padx=4)
+        ttk.Button(self, text="↑", command=lambda: self._step(self.large_step.get())).grid(row=2, column=2, padx=2)
+        ttk.Button(self, text="↓", command=lambda: self._step("-" + self.large_step.get())).grid(row=2, column=3, padx=2)
+
+        ttk.Label(self, text="速度 μs").grid(row=1, column=4, padx=4)
+        ttk.Entry(self, textvariable=self.speed_us, width=8).grid(row=1, column=5, padx=4)
+        ttk.Button(self, text="设定", command=self._set_speed).grid(row=1, column=6, padx=4)
+        ttk.Button(self, text="停止", command=lambda: self._cmd("STOP")).grid(row=2, column=4, padx=2)
+        ttk.Button(self, text="归零", command=lambda: self._cmd("ZERO")).grid(row=2, column=5, padx=2)
 
         self._pos_label = ttk.Label(self, text="位置: --")
-        self._pos_label.grid(row=1, column=6, padx=4)
+        self._pos_label.grid(row=2, column=6, padx=4)
 
     def _cmd(self, cmd):
+        connected = self.spout.port and self.spout.port.is_open
+        if not connected:
+            self._status_label.config(text="● 未连接", foreground="red")
+            messagebox.showwarning("电机未连接",
+                "请先在连接面板选择 Motor Nano 的 COM 口，点击 '连接' 按钮")
+            return
+        self._status_label.config(text="● 已连接", foreground="green")
         try:
             self.spout.write(cmd)
         except Exception as exc:
+            self._status_label.config(text="● 通信错误", foreground="orange")
             messagebox.showerror("电机命令失败", str(exc))
 
     def _step(self, steps):

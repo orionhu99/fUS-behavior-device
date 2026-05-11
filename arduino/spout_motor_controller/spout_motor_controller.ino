@@ -6,7 +6,7 @@
 const byte stepPin = 2;
 const byte dirPin = 3;
 const byte enablePin = 4;
-const bool enableActiveLow = true;
+const bool enableActiveLow = false;
 
 unsigned int stepDelayUs = 2000;
 long positionSteps = 0;

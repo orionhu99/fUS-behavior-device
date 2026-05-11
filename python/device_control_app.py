@@ -92,31 +92,66 @@ class SerialDevice:
 
 
 class VideoRecorder:
+    """摄像头预览与录像。
+
+    预览模式下打开 cv2.imshow 小窗实时显示画面，不保存。
+    录像模式下同时预览 + 写入 AVI + 帧时间戳 CSV。
+    摄像头由预览或录像首次启动时打开，两者都停止后释放。
+    """
+
     def __init__(self, event_queue):
         self.event_queue = event_queue
-        self.running = False
+        self.previewing = False
+        self.recording = False
         self.thread = None
         self.cap = None
         self.writer = None
         self.timestamp_file = None
         self.timestamp_writer = None
+        self._camera_index = 0
+        self._fps = 30.0
 
-    def start(self, camera_index, output_dir, fps=30.0):
+    # ── 预览 ────────────────────────────────────────
+
+    def start_preview(self, camera_index=0):
         if cv2 is None:
             raise RuntimeError("opencv-python 未安装")
-        if self.running:
+        if self.previewing:
+            return
+        self._camera_index = int(camera_index)
+        self._ensure_camera()
+        self.previewing = True
+        self._start_loop_if_needed()
+        self.event_queue.put(("host", "camera", "PREVIEW_START", ""))
+
+    def stop_preview(self):
+        if not self.previewing:
+            return
+        self.previewing = False
+        self._stop_loop_if_needed()
+        self.event_queue.put(("host", "camera", "PREVIEW_STOP", ""))
+
+    @property
+    def is_previewing(self):
+        return self.previewing
+
+    # ── 录像 ────────────────────────────────────────
+
+    def start_recording(self, camera_index, output_dir, fps=30.0):
+        if cv2 is None:
+            raise RuntimeError("opencv-python 未安装")
+        if self.recording:
             return
 
+        self._camera_index = int(camera_index)
+        self._fps = float(fps)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         video_path = output_dir / f"behavior_{stamp}.avi"
         ts_path = output_dir / f"behavior_{stamp}_frames.csv"
 
-        self.cap = cv2.VideoCapture(int(camera_index), cv2.CAP_DSHOW)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"无法打开摄像头 {camera_index}")
-
+        self._ensure_camera()
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
@@ -126,40 +161,90 @@ class VideoRecorder:
         self.timestamp_writer = csv.writer(self.timestamp_file)
         self.timestamp_writer.writerow(["frame", "host_time_s", "host_monotonic_s"])
 
-        self.running = True
-        self.thread = threading.Thread(target=self._record_loop, daemon=True)
-        self.thread.start()
-        self.event_queue.put(("host", "camera", "VIDEO_START", str(video_path)))
+        self.recording = True
+        self._start_loop_if_needed()
+        self.event_queue.put(("host", "camera", "RECORDING_START", str(video_path)))
 
-    def stop(self):
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=2)
-        if self.cap:
-            self.cap.release()
+    def stop_recording(self):
+        if not self.recording:
+            return
+        self.recording = False
         if self.writer:
             self.writer.release()
+            self.writer = None
         if self.timestamp_file:
             self.timestamp_file.close()
-        self.cap = None
-        self.writer = None
-        self.timestamp_file = None
+            self.timestamp_file = None
         self.timestamp_writer = None
-        self.event_queue.put(("host", "camera", "VIDEO_STOP", ""))
+        self._stop_loop_if_needed()
+        self.event_queue.put(("host", "camera", "RECORDING_STOP", ""))
 
-    def _record_loop(self):
+    # ── 全部停止 ────────────────────────────────────
+
+    def stop(self):
+        self.stop_recording()
+        self.stop_preview()
+
+    # ── 内部 ────────────────────────────────────────
+
+    def _ensure_camera(self):
+        if self.cap is not None:
+            return
+        self.cap = cv2.VideoCapture(self._camera_index, cv2.CAP_DSHOW)
+        if not self.cap.isOpened():
+            self.cap = None
+            raise RuntimeError(f"无法打开摄像头 {self._camera_index}")
+
+    def _start_loop_if_needed(self):
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.thread.start()
+
+    def _stop_loop_if_needed(self):
+        if self.previewing or self.recording:
+            return
+        # 两者都停了，等待线程退出
+        if self.thread:
+            self.thread.join(timeout=3)
+            self.thread = None
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+        cv2.destroyWindow("摄像头预览")
+
+    def _capture_loop(self):
         frame_id = 0
-        while self.running and self.cap and self.writer:
+        while (self.previewing or self.recording) and self.cap and self.cap.isOpened():
             ok, frame = self.cap.read()
             if not ok:
                 self.event_queue.put(("host", "camera", "FRAME_DROP", str(frame_id)))
                 time.sleep(0.01)
                 continue
-            now_wall = time.time()
-            now_mono = time.perf_counter()
-            self.writer.write(frame)
-            self.timestamp_writer.writerow([frame_id, f"{now_wall:.6f}", f"{now_mono:.6f}"])
-            frame_id += 1
+
+            # 预览窗口
+            cv2.imshow("摄像头预览", frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                # 按 Q 关闭预览（不关录像）
+                self.previewing = False
+                self._stop_loop_if_needed()
+                break
+
+            # 写入录像文件
+            if self.recording and self.writer:
+                now_wall = time.time()
+                now_mono = time.perf_counter()
+                self.writer.write(frame)
+                if self.timestamp_writer:
+                    self.timestamp_writer.writerow([frame_id, f"{now_wall:.6f}", f"{now_mono:.6f}"])
+                frame_id += 1
+
+        # 线程退出时清理
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+        cv2.destroyWindow("摄像头预览")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -199,6 +284,10 @@ class App(tk.Tk):
 
         # 协议引擎试次完成回调 → 舔水图表
         self.protocol_engine.on_trial_complete = self._lick_plot.add_trial
+
+        # 协议状态变化：保留面板回调 + 增加自动录像
+        self._panel_state_cb = self.protocol_engine.on_state_changed
+        self.protocol_engine.on_state_changed = self._combined_state_changed
 
         # 定时器
         self.after(50, self._drain_events)
@@ -291,6 +380,30 @@ class App(tk.Tk):
     def _tick_protocol(self):
         self.protocol_engine.tick()
         self.after(20, self._tick_protocol)
+
+    def _combined_state_changed(self, state, info):
+        if self._panel_state_cb:
+            self._panel_state_cb(state, info)
+        self._on_protocol_state(state, info)
+
+    def _on_protocol_state(self, state, info):
+        # 协议运行时自动录像，停止时自动停止
+        from protocol_engine import State
+        if state == State.IDLE:
+            if self.video.recording:
+                self.video.stop_recording()
+                self.conn_panel._btn_record.config(text="录像")
+        else:
+            if not self.video.recording and self.water.port:
+                self._ensure_log()
+                try:
+                    self.video.start_recording(
+                        self.conn_panel.camera_index.get(),
+                        self.output_dir.get()
+                    )
+                    self.conn_panel._btn_record.config(text="停止录像")
+                except Exception:
+                    pass  # 摄像头可能未连接
 
     # ── 关闭 ────────────────────────────────────────
 
