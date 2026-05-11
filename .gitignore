@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# 输出文件（录音/视频）
+recordings/
+
+# 协议配置（用户自定义）
+python/protocol_configs/*.json
+!python/protocol_configs/default.json
+
+# Claude Code 内部
+.claude/
+
+# MCP 配置
+.mcp.json
+
+# Arduino 编译产物
+arduino/**/build/
