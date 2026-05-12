@@ -14,13 +14,11 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════
 
 class ConnectionPanel(ttk.LabelFrame):
-    def __init__(self, parent, water_dev, spout_dev, video, output_dir_var):
+    def __init__(self, parent, water_dev, spout_dev, video):
         super().__init__(parent, text="连接", padding=6)
         self.water = water_dev
         self.spout = spout_dev
         self.video = video
-        self.output_dir = output_dir_var
-        self._ensure_log = None
         self._preview_on = False
         self._build()
 
@@ -45,9 +43,6 @@ class ConnectionPanel(ttk.LabelFrame):
         ttk.Entry(self, textvariable=self.camera_index, width=5).grid(row=row, column=1, sticky="w", padx=2)
         self._btn_preview = ttk.Button(self, text="预览", command=self._toggle_preview)
         self._btn_preview.grid(row=row, column=2, padx=2)
-        self._btn_record = ttk.Button(self, text="录像", command=self._toggle_recording)
-        self._btn_record.grid(row=row, column=3, padx=2)
-        ttk.Button(self, text="目录", command=self._choose_folder).grid(row=row, column=4, padx=2)
 
     def _list_ports(self):
         try:
@@ -57,13 +52,9 @@ class ConnectionPanel(ttk.LabelFrame):
 
     def _connect_water(self):
         self.water.connect(self.water_port.get())
-        if self._ensure_log:
-            self._ensure_log()
 
     def _connect_z(self):
         self.spout.connect(self.z_port.get())
-        if self._ensure_log:
-            self._ensure_log()
 
     def _toggle_preview(self):
         if self._preview_on:
@@ -77,24 +68,6 @@ class ConnectionPanel(ttk.LabelFrame):
                 self._btn_preview.config(text="关闭")
             except Exception as exc:
                 messagebox.showerror("预览失败", str(exc))
-
-    def _toggle_recording(self):
-        if self.video.recording:
-            self.video.stop_recording()
-            self._btn_record.config(text="录像")
-        else:
-            try:
-                if self._ensure_log:
-                    self._ensure_log()
-                self.video.start_recording(self.camera_index.get(), self.output_dir.get())
-                self._btn_record.config(text="停止")
-            except Exception as exc:
-                messagebox.showerror("录像失败", str(exc))
-
-    def _choose_folder(self):
-        folder = filedialog.askdirectory()
-        if folder:
-            self.output_dir.set(folder)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -220,11 +193,34 @@ class MotorControlPanel(ttk.LabelFrame):
 # 协议面板（简化版）
 # ═══════════════════════════════════════════════════════════
 
+def _make_tooltip(widget, text):
+    """鼠标悬停显示提示窗"""
+    tw = None
+    def enter(e):
+        nonlocal tw
+        tw = tk.Toplevel(widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{e.x_root+10}+{e.y_root+10}")
+        lbl = tk.Label(tw, text=text, font=("", 8), background="#FFFFCC",
+                       relief="solid", borderwidth=1, padx=4, pady=2)
+        lbl.pack()
+    def leave(e):
+        nonlocal tw
+        if tw:
+            tw.destroy()
+            tw = None
+    widget.bind("<Enter>", enter)
+    widget.bind("<Leave>", leave)
+
+
 class ProtocolPanel(ttk.LabelFrame):
     def __init__(self, parent, engine, config_manager):
         super().__init__(parent, text="Task 设置", padding=6)
         self.engine = engine
         self.config_mgr = config_manager
+        self._data_dir = tk.StringVar(value="")
+        self._on_stop_callback = None  # App 设置
+        self._on_start_callback = None
         self._build()
         self._wire_engine()
 
@@ -240,30 +236,45 @@ class ProtocolPanel(ttk.LabelFrame):
         self.session_timeout = tk.StringVar(value=str(params["session_timeout_s"]))
         self.config_name = tk.StringVar(value="default")
 
-        # ── 参数 ──
+        # ── 参数（带 tooltip 问号）──
         r = 0
-        ttk.Label(self, text="Cue ms").grid(row=r, column=0, sticky="w", padx=2, pady=1)
+        def _qlbl(text, tip, row, col):
+            '''标签文字一致，? 小号灰色悬停提示'''
+            fr = ttk.Frame(self)
+            fr.grid(row=row, column=col, sticky="w", padx=2, pady=1)
+            ttk.Label(fr, text=text).pack(side="left")
+            q = ttk.Label(fr, text=" ?", font=("", 7), foreground="#aaaaaa", cursor="hand2")
+            q.pack(side="left")
+            _make_tooltip(q, tip)
+
+        _qlbl("Cue ms", "8kHz纯音播放时长", r, 0)
         ttk.Entry(self, textvariable=self.cue_dur, width=7).grid(row=r, column=1, padx=2)
-        ttk.Label(self, text="窗口 ms").grid(row=r, column=2, sticky="w", padx=2)
+        _qlbl("窗口 ms", "cue播放后等待舔水的时间，超时记为MISS", r, 2)
         ttk.Entry(self, textvariable=self.window_dur, width=7).grid(row=r, column=3, padx=2)
         ttk.Label(self, text="给水 ms").grid(row=r, column=4, sticky="w", padx=2)
         ttk.Entry(self, textvariable=self.reward_dose, width=7).grid(row=r, column=5, padx=2)
 
         r += 1
-        ttk.Label(self, text="ITI 最短 s").grid(row=r, column=0, sticky="w", padx=2, pady=1)
+        _qlbl("ITI min s", "试次之间最短间隔", r, 0)
         ttk.Entry(self, textvariable=self.iti_min, width=7).grid(row=r, column=1, padx=2)
-        ttk.Label(self, text="最长 s").grid(row=r, column=2, sticky="w", padx=2)
+        _qlbl("max s", "试次之间最长间隔（随机取值）", r, 2)
         ttk.Entry(self, textvariable=self.iti_max, width=7).grid(row=r, column=3, padx=2)
-        ttk.Label(self, text="最大试次").grid(row=r, column=4, sticky="w", padx=2)
+        _qlbl("最大试次", "达到后自动停止（0=不限）", r, 4)
         ttk.Entry(self, textvariable=self.max_trials, width=7).grid(row=r, column=5, padx=2)
 
         r += 1
-        ttk.Label(self, text="最长时长 s").grid(row=r, column=0, sticky="w", padx=2, pady=1)
+        _qlbl("最长时长 s", "实验超时自动停止", r, 0)
         ttk.Entry(self, textvariable=self.session_timeout, width=7).grid(row=r, column=1, padx=2)
         ttk.Button(self, text="应用", command=self._apply_params).grid(row=r, column=2, columnspan=2, padx=2, sticky="ew")
 
         ttk.Label(self, text="配置").grid(row=r, column=4, sticky="w", padx=2)
         ttk.Entry(self, textvariable=self.config_name, width=8).grid(row=r, column=5, padx=2)
+
+        # 数据目录
+        r += 1
+        ttk.Label(self, text="数据目录:").grid(row=r, column=0, sticky="w", padx=2, pady=2)
+        ttk.Label(self, textvariable=self._data_dir, font=("", 7), foreground="gray").grid(row=r, column=1, columnspan=4, sticky="w", padx=2)
+        ttk.Button(self, text="浏览", command=self._choose_data_dir).grid(row=r, column=5, padx=2, sticky="w")
 
         # ── 控制按钮 ──
         r += 1
@@ -275,14 +286,14 @@ class ProtocolPanel(ttk.LabelFrame):
         btn_frame.columnconfigure(3, weight=1)
         btn_frame.columnconfigure(4, weight=1)
 
-        self._btn_run = ttk.Button(btn_frame, text="▶ 运行", command=self.engine.start)
+        self._btn_run = ttk.Button(btn_frame, text="▶ 运行", command=self._do_start)
         self._btn_run.grid(row=0, column=0, padx=1, sticky="ew")
         self._btn_pause = ttk.Button(btn_frame, text="⏸ 暂停", command=self.engine.pause, state="disabled")
         self._btn_pause.grid(row=0, column=1, padx=1, sticky="ew")
-        self._btn_stop = ttk.Button(btn_frame, text="■ 停止", command=self.engine.stop, state="disabled")
+        self._btn_stop = ttk.Button(btn_frame, text="■ 停止", command=self._do_stop, state="disabled")
         self._btn_stop.grid(row=0, column=2, padx=1, sticky="ew")
-        ttk.Button(btn_frame, text="保存", command=self._save_config).grid(row=0, column=3, padx=1, sticky="ew")
-        ttk.Button(btn_frame, text="加载", command=self._load_config).grid(row=0, column=4, padx=1, sticky="ew")
+        ttk.Button(btn_frame, text="保存配置", command=self._save_config).grid(row=0, column=3, padx=1, sticky="ew")
+        ttk.Button(btn_frame, text="加载配置", command=self._load_config).grid(row=0, column=4, padx=1, sticky="ew")
 
         # ── 状态 ──
         r += 1
@@ -305,6 +316,30 @@ class ProtocolPanel(ttk.LabelFrame):
 
     def _wire_engine(self):
         self.engine.on_state_changed = self._on_state_change
+
+    def _do_start(self):
+        if not self.engine.is_water_connected:
+            messagebox.showwarning("未连接", "请先连接 Water Nano")
+            return
+        if self._on_start_callback:
+            self._on_start_callback()
+        self.engine.start()
+
+    def _do_stop(self):
+        if not messagebox.askyesno("停止实验", "停止实验？\n数据将自动保存。"):
+            return
+        if self._on_stop_callback:
+            self._on_stop_callback()
+        self.engine.stop()
+
+    def _choose_data_dir(self):
+        folder = filedialog.askdirectory(title="选择数据保存目录")
+        if folder:
+            self._data_dir.set(folder)
+
+    def get_data_dir(self):
+        d = self._data_dir.get().strip()
+        return d if d else None
 
     def _on_state_change(self, state, info):
         self.after(0, lambda: self._update_state(state, info))

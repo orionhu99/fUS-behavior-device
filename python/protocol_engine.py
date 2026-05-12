@@ -57,6 +57,7 @@ class ProtocolEngine:
         self._iti_had_lick = False     # 当前 ITI 是否有过舔水
         self._prev_missed = False      # 上次 trial 是否 MISS
         self._trial_end_mono = 0.0     # 上次 trial 结束时刻（宽容窗口用）
+        self._paused_at_mono = 0.0     # 暂停时刻
         self._session_mono_start = 0.0
 
         self.on_state_changed = None
@@ -65,16 +66,24 @@ class ProtocolEngine:
 
     # ── 公共 ──────────────────────────────────────────
 
+    @property
+    def is_water_connected(self):
+        return self._dev.port is not None and self._dev.port.is_open
+
     def start(self):
         if self.state != State.IDLE:
-            return
+            return False
+        if not self.is_water_connected:
+            return False
         self._session_mono_start = time.perf_counter()
         self._trial_num = 0
         self._total_licks = 0
         self._total_rewards = 0
         self._total_missed = 0
         self._prev_missed = False
+        self._iti_had_lick = False
         self._transition(State.ITI)
+        return True
 
     def stop(self):
         self._dev.write("STOP")
@@ -87,11 +96,16 @@ class ProtocolEngine:
         if self.state in (State.IDLE, State.PAUSED):
             return
         self._state_before_pause = self.state
+        self._paused_at_mono = time.perf_counter()
         self._transition(State.PAUSED)
 
     def resume(self):
         if self.state != State.PAUSED or self._state_before_pause is None:
             return
+        # 恢复时补偿暂停时长，deadline 顺延
+        elapsed = time.perf_counter() - self._paused_at_mono
+        if self._deadline > 0:
+            self._deadline += elapsed
         self._transition(self._state_before_pause)
         self._state_before_pause = None
 
@@ -122,6 +136,7 @@ class ProtocolEngine:
                 else:
                     self._iti_lick_times.append(now)
                     self._iti_had_lick = True
+                    self._notify_state()  # 实时更新状态面板"下次补水"
 
     # ── 状态转换 ──────────────────────────────────────
 

@@ -1,13 +1,10 @@
 """fUS behavior device control - main application."""
 
-import csv
 import queue
 import threading
 import time
 import tkinter as tk
-from datetime import datetime
-from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import ttk
 
 # 中文字体（tkinter 默认在 Windows 上支持中文，matplotlib 在 lick_plot 中配置）
 
@@ -303,7 +300,7 @@ class App(tk.Tk):
         self.spout_motor = SerialDevice("spout_motor", self.events)
         self.video = VideoRecorder(self.events)
 
-        # 心跳检测
+        # 心跳
         self._last_water_rx = time.perf_counter()
         self._reconnecting = False
 
@@ -311,43 +308,41 @@ class App(tk.Tk):
         self.protocol_engine = ProtocolEngine(self.water, self.events)
         self.config_mgr = ConfigManager()
 
-        # 日志
-        self.log_file = None
-        self.log_writer = None
-
-        # 输出目录
-        self.output_dir = tk.StringVar(value=str(Path.cwd() / "recordings"))
+        # 统一数据管理
+        self.data_mgr = None
+        self._trial_results = []
 
         # 构建 UI
         self._build_ui()
 
-        # 回调
-        self.protocol_engine.on_trial_complete = self._lick_plot.add_trial
+        # 回调：试次完成 → 图表 + 收集数据
+        self.protocol_engine.on_trial_complete = self._on_trial_result
         self._panel_state_cb = self.protocol_engine.on_state_changed
         self.protocol_engine.on_state_changed = self._combined_state_changed
+
+        # Protocol 面板 → 数据管理回调
+        self.protocol_panel._on_start_callback = self._on_task_start
+        self.protocol_panel._on_stop_callback = self._on_task_stop
 
         # 定时器
         self.after(15, self._drain_events)
         self.after(20, self._tick_protocol)
         self.after(500, self._refresh_plot)
         self.after(3000, self._heartbeat)
+        # 时间线初始显示
+        self.after(300, lambda: self._lick_plot.refresh())
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
-        # 根窗口权重
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        # ── 垂直主分隔 ──
         main_v = ttk.PanedWindow(self, orient="vertical")
         main_v.grid(row=0, column=0, sticky="nsew", padx=6, pady=4)
 
         # ① 连接
-        self.conn_panel = ConnectionPanel(
-            main_v, self.water, self.spout_motor, self.video, self.output_dir
-        )
-        self.conn_panel._ensure_log = self._ensure_log
+        self.conn_panel = ConnectionPanel(main_v, self.water, self.spout_motor, self.video)
 
         # ② 水平分隔：控制+电机 | Task
         top_h = ttk.PanedWindow(main_v, orient="horizontal")
@@ -375,23 +370,45 @@ class App(tk.Tk):
         self.log_panel = EventLogPanel(bottom_h)
         bottom_h.add(self.log_panel, weight=2)
 
-        # ── 组装 ──
         main_v.add(self.conn_panel, weight=0)
         main_v.add(top_h, weight=0)
         main_v.add(plot_frame, weight=1)
         main_v.add(bottom_h, weight=0)
 
-    # ── 日志 ────────────────────────────────────────
+    # ── Task 生命周期 ───────────────────────────────
 
-    def _ensure_log(self):
-        if self.log_writer:
-            return
-        out = Path(self.output_dir.get())
-        out.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_file = open(out / f"device_events_{stamp}.csv", "w", newline="", encoding="utf-8")
-        self.log_writer = csv.writer(self.log_file)
-        self.log_writer.writerow(["host_time_s", "host_monotonic_s", "source", "device", "event", "value"])
+    def _on_task_start(self):
+        """Task 开始：创建数据目录 + 开始录像"""
+        from data_manager import DataManager
+        self.data_mgr = DataManager()
+        self.data_mgr.start_session(
+            base_dir=self.protocol_panel.get_data_dir(),
+            protocol_params=self.protocol_engine.params
+        )
+        # 显示目录
+        self.protocol_panel._data_dir.set(str(self.data_mgr.session_dir))
+        # 自动录像
+        try:
+            self.video.start_recording(
+                self.conn_panel.camera_index.get(),
+                str(self.data_mgr.session_dir)
+            )
+        except Exception:
+            pass
+
+    def _on_trial_result(self, result):
+        """试次完成：更新图表 + 收集数据"""
+        self._lick_plot.add_trial(result)
+        self._trial_results.append(result)
+
+    def _on_task_stop(self):
+        """Task 停止：保存汇总 + 停止录像"""
+        if self.data_mgr:
+            self.data_mgr.end_session(trial_results=self._trial_results)
+            self.data_mgr = None
+        self._trial_results = []
+        self.video.stop_recording()
+        self._lick_plot.clear()
 
     # ── 事件处理 ────────────────────────────────────
 
@@ -405,10 +422,9 @@ class App(tk.Tk):
             wall = time.time()
             mono = time.perf_counter()
 
-            # 日志文件
-            if self.log_writer:
-                self.log_writer.writerow([f"{wall:.6f}", f"{mono:.6f}", source, device, event, value])
-                self.log_file.flush()
+            # 日志文件（DataManager）
+            if self.data_mgr:
+                self.data_mgr.log_event(wall, mono, source, device, event, value)
 
             # GUI 日志面板（过滤高频 SYNC 事件）
             if event != "SYNC":
@@ -477,6 +493,8 @@ class App(tk.Tk):
             self.status_panel.set_water_connected()
             if "MPR121_OK" in value:
                 self.status_panel.set_mpr121(True)
+        elif device == "spout_motor" and event == "CONNECTED":
+            self.status_panel.set_motor_connected()
         elif device == "water" and event == "RX":
             parts = value.split(",")
             if len(parts) >= 3:
@@ -506,22 +524,7 @@ class App(tk.Tk):
         self.status_panel.set_smart_water(info.get("smart_water", "正常"))
 
     def _on_protocol_state(self, state, info):
-        from protocol_engine import State
-        if state == State.IDLE:
-            if self.video.recording:
-                self.video.stop_recording()
-                self.conn_panel._btn_record.config(text="录像")
-        elif state != State.PAUSED:
-            if not self.video.recording and self.water.port:
-                self._ensure_log()
-                try:
-                    self.video.start_recording(
-                        self.conn_panel.camera_index.get(),
-                        self.output_dir.get()
-                    )
-                    self.conn_panel._btn_record.config(text="停止")
-                except Exception:
-                    pass
+        pass  # 录像由 _on_task_start/_on_task_stop 统一管理
 
     # ── 关闭 ────────────────────────────────────────
 
@@ -530,8 +533,8 @@ class App(tk.Tk):
         self.video.stop()
         self.water.disconnect()
         self.spout_motor.disconnect()
-        if self.log_file:
-            self.log_file.close()
+        if self.data_mgr:
+            self.data_mgr.end_session()
         self.destroy()
 
 

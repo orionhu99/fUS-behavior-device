@@ -567,13 +567,22 @@ recordings/
 
 ## 时间对齐
 
-三层对齐策略：
+**推荐方案：纯 USB 软件时间戳（±5ms，一帧以内）**
 
-1. Arduino 串口 CSV 中的 `millis()` 事件时间戳
-2. 主机 `perf_counter` 时间戳（设备日志 + 视频帧日志）
-3. 物理 TTL 线接入成像/采集系统（D8/D9/D10/D11）
+events.csv 中每条事件和 video_frames.csv 中每帧都有 `host_monotonic_s`（`time.perf_counter()`），两者统一时间轴对齐。
 
-正式实验时保持 D10 sync TTL 全程运行。
+数据目录结构：
+```
+data/20260512_143000/
+  events.csv          ← 所有事件 + host_monotonic_s
+  video.avi           ← 摄像头录像
+  video_frames.csv    ← 每帧时间戳
+  session.json        ← 协议参数 + 试次汇总
+```
+
+**可选方案：物理 TTL 同步**
+
+如需硬件级同步，Nano D8( Reward ) / D9( Lick ) / D10( Sync ) 通过 BNC 接入成像系统数字输入。Sync 每 5s 脉冲一次。
 
 ---
 
