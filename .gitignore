@@ -5,6 +5,9 @@ __pycache__/
 # 输出文件（录音/视频）
 recordings/
 
+# 实验数据
+data/
+
 # 协议配置（用户自定义）
 python/protocol_configs/*.json
 !python/protocol_configs/default.json
